@@ -19,6 +19,8 @@ struct CacheEntry: Codable {
     var metrics: Metrics
     var dHash: UInt64
     var featurePrint: Data?
+    var text: String? = nil      // распознанный текст (только для скриншотов)
+    var hasCode: Bool? = nil     // есть QR или штрихкод
 }
 
 /// Решения пользователя — живут между запусками
@@ -45,6 +47,8 @@ struct PhotoInfo: Identifiable, @unchecked Sendable {
     let m: Metrics
     let dHash: UInt64
     let featurePrint: VNFeaturePrintObservation?
+    let text: String?
+    let tags: [ScreenshotTag]
 
     /// Общая оценка: качество кадра + бонус за избранное и правки
     var score: Double {
@@ -145,4 +149,96 @@ enum Store {
     }
 
     static func clearCache() { try? FileManager.default.removeItem(at: cacheURL) }
+}
+
+/// Что важного нашлось на скриншоте
+enum ScreenshotTag: String, CaseIterable {
+    case secret, document, money, ticket, address, contact, qr
+
+    var emoji: String {
+        switch self {
+        case .secret: return "🔑"
+        case .document: return "📄"
+        case .money: return "💳"
+        case .ticket: return "✈️"
+        case .address: return "📍"
+        case .contact: return "📞"
+        case .qr: return "🔳"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .secret: return "пароль / код"
+        case .document: return "документ"
+        case .money: return "деньги / банк"
+        case .ticket: return "билет / бронь"
+        case .address: return "адрес"
+        case .contact: return "контакт"
+        case .qr: return "QR / штрихкод"
+        }
+    }
+}
+
+/// Ищет в тексте скриншота важную информацию. Лучше лишний раз защитить, чем удалить нужное.
+enum ScreenshotSorter {
+    static let keywords: [ScreenshotTag: [String]] = [
+        .secret: ["пароль", "password", "passcode", "логин", "login", "pin", "пин-код", "пин код",
+                  "код подтверждения", "verification code", "one-time", "2fa", "otp", "seed",
+                  "recovery phrase", "secret phrase", "мнемон", "private key", "приватный ключ",
+                  "api key", "token", "mật khẩu", "wi-fi", "wifi", "ключ"],
+        .document: ["паспорт", "passport", "виза", "visa", "снилс", "инн", "свидетельство", "договор",
+                    "contract", "полис", "insurance policy", "водительск", "driver", "license", "лицензи",
+                    "справк", "certificate", "id card", "căn cước", "hộ chiếu", "residence",
+                    "tạm trú", "e-visa", "evisa", "документ", "document"],
+        .money: ["перевод", "transfer", "чек", "receipt", "квитанц", "счёт", "счет", "invoice",
+                 "оплат", "payment", "paid", "баланс", "balance", "iban", "swift", "бик",
+                 "account number", "số tài khoản", "chuyển khoản", "usdt", "trc20", "erc20",
+                 "₫", "vnd", "₽", "руб", "usd", "eur", "сбер", "тинькофф", "t-bank", "альфа",
+                 "vietcombank", "techcombank", "momo", "binance", "bybit", "транзакц",
+                 "transaction", "txid", "кошел", "wallet"],
+        .ticket: ["билет", "ticket", "boarding", "посадочн", "рейс", "flight", "бронь", "booking",
+                  "reservation", "бронирован", "check-in", "seat", "vé", "đặt phòng", "hotel",
+                  "отель", "pnr", "gate"],
+        .address: ["адрес", "address", "ул.", "улица", "street", "đường", "phường", "quận",
+                   "district", "ward", "этаж", "apartment", "координат"]
+    ]
+
+    static let patterns: [(ScreenshotTag, String)] = [
+        (.contact, "[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}"),
+        (.contact, "\\+\\d[\\d\\s()-]{8,}\\d"),
+        (.contact, "(?<!\\d)(?:0|8)\\d{9,10}(?!\\d)"),
+        (.money, "(?:\\d[ -]?){16}"),
+        (.money, "0x[a-fA-F0-9]{40}|T[1-9A-HJ-NP-Za-km-z]{33}|bc1[a-z0-9]{25,59}")
+    ]
+
+    static func tags(text: String, hasCode: Bool) -> [ScreenshotTag] {
+        var found = Set<ScreenshotTag>()
+        if hasCode { found.insert(.qr) }
+        let lower = text.lowercased()
+        for (tag, words) in keywords where words.contains(where: { has(lower, $0) }) {
+            found.insert(tag)
+        }
+        let range = NSRange(text.startIndex..., in: text)
+        for (tag, pattern) in patterns where !found.contains(tag) {
+            if let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+               re.firstMatch(in: text, options: [], range: range) != nil {
+                found.insert(tag)
+            }
+        }
+        return ScreenshotTag.allCases.filter { found.contains($0) }
+    }
+
+    /// Короткие латинские слова (pin, gate, seat…) ищем только целым словом,
+    /// чтобы "shopping" или "navigate" не считались паролем или билетом
+    static func has(_ lower: String, _ word: String) -> Bool {
+        let shortLatin = word.count <= 5 && word.unicodeScalars.allSatisfy { $0.isASCII }
+        guard shortLatin else { return lower.contains(word) }
+        let pattern = "(?<![a-z0-9])" + NSRegularExpression.escapedPattern(for: word) + "(?![a-z0-9])"
+        return lower.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    static func wordCount(_ text: String?) -> Int {
+        (text ?? "").split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
+    }
 }
