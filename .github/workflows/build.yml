@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-15
@@ -39,3 +42,10 @@ jobs:
         with:
           name: PhotoCleaner-ipa
           path: PhotoCleaner.ipa
+
+      - name: Publish to Releases (latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest PhotoCleaner.ipa --title "Чистка фото — свежая сборка" --notes "Собрано из ${{ github.sha }}" --latest
