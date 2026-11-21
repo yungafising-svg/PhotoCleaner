@@ -81,7 +81,7 @@ struct ContentView: View {
                 }
             } footer: {
                 if scanner.phase == .done {
-                    Text("Неудачные, но единственные кадры не трогаем — это память. Скриншоты, избранное, фото из альбомов и отредактированные тоже защищены. Повторный скан проверяет только новые фото.")
+                    Text("Неудачные, но единственные кадры не трогаем — это память. Скриншоты с паролями, документами, деньгами, билетами, адресами, контактами и QR защищены. Избранное, фото из альбомов и отредактированные — тоже. Повторный скан проверяет только новые фото.")
                 }
             }
 
@@ -94,6 +94,9 @@ struct ContentView: View {
                     }
                     NavigationLink { GroupsView() } label: {
                         row("Похожие и дубликаты", "square.on.square", scanner.groups.count)
+                    }
+                    NavigationLink { ScreenshotsView() } label: {
+                        row("Скриншоты на проверку", "iphone", scanner.screenshotsCheck.count)
                     }
                     NavigationLink { FlaggedGridView(title: "Случайные кадры", list: \.accidental) } label: {
                         row("Случайные кадры", "camera.metering.unknown", scanner.visible(scanner.accidental).count)
@@ -259,6 +262,81 @@ struct FlaggedGridView: View {
     }
 }
 
+// MARK: - Скриншоты
+
+struct ScreenshotsView: View {
+    @EnvironmentObject var scanner: Scanner
+    @State private var tab = 0
+    @State private var compare: CompareTarget?
+    private let columns = [GridItem(.adaptive(minimum: 100), spacing: 4)]
+
+    var body: some View {
+        let ids = tab == 0 ? scanner.visible(scanner.screenshotsCheck) : scanner.screenshotsImportant
+        let allIn = !ids.isEmpty && ids.allSatisfy { scanner.inTrash($0) }
+        ScrollView {
+            Picker("", selection: $tab) {
+                Text("На проверку · \(scanner.visible(scanner.screenshotsCheck).count)").tag(0)
+                Text("Важные · \(scanner.screenshotsImportant.count)").tag(1)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal)
+
+            Text(tab == 0
+                 ? "Паролей, документов, денег, билетов, адресов, контактов и QR здесь не нашёл. Сначала — без текста, потом самые старые. Тап — в корзину, ⤢ — крупно с распознанным текстом."
+                 : "Здесь нашлось важное. Приложение не предложит их удалить. ⤢ — посмотреть, что именно найдено.")
+                .font(.caption).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal)
+
+            if ids.isEmpty {
+                ContentUnavailableView("Пусто", systemImage: "checkmark.seal").padding(.top, 60)
+            }
+            LazyVGrid(columns: columns, spacing: 4) {
+                ForEach(ids, id: \.self) { id in
+                    if let p = scanner.photos[id] {
+                        SelectableThumb(asset: p.asset,
+                                        selected: scanner.inTrash(id),
+                                        locked: tab == 1,
+                                        onExpand: { compare = CompareTarget(ids: ids, start: id, isGroup: false) })
+                            .overlay(alignment: .topLeading) {
+                                if !p.tags.isEmpty {
+                                    Text(p.tags.map(\.emoji).joined())
+                                        .font(.caption)
+                                        .padding(.horizontal, 4).padding(.vertical, 2)
+                                        .background(.ultraThinMaterial, in: Capsule())
+                                        .padding(4)
+                                }
+                            }
+                            .onTapGesture {
+                                if tab == 0 {
+                                    scanner.toggleTrash(id)
+                                } else {
+                                    compare = CompareTarget(ids: ids, start: id, isGroup: false)
+                                }
+                            }
+                    }
+                }
+            }
+            .padding(4)
+        }
+        .navigationTitle("Скриншоты")
+        .toolbar {
+            if tab == 0 && !ids.isEmpty {
+                NavigationLink {
+                    SwipeView(title: "Скриншоты", assets: ids.compactMap { scanner.photos[$0]?.asset })
+                } label: {
+                    Image(systemName: "hand.draw")
+                }
+                Button(allIn ? "Снять все" : "Выбрать все") {
+                    if allIn { scanner.removeFromTrash(ids) } else { scanner.addToTrash(ids) }
+                }
+            }
+        }
+        .safeAreaInset(edge: .bottom) { TrashBar() }
+        .fullScreenCover(item: $compare) { CompareView(target: $0) }
+    }
+}
+
 // MARK: - Крупный просмотр и сравнение
 
 struct CompareView: View {
@@ -309,6 +387,27 @@ struct CompareView: View {
                     }
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.8))
+
+                    if let p = scanner.photos[current], p.isScreenshot {
+                        VStack(alignment: .leading, spacing: 4) {
+                            if p.tags.isEmpty {
+                                Text("Важного не нашёл — проверь сам").font(.caption.bold()).foregroundStyle(.orange)
+                            } else {
+                                Text("Важное: " + p.tags.map { $0.emoji + " " + $0.label }.joined(separator: ", "))
+                                    .font(.caption.bold()).foregroundStyle(.yellow)
+                            }
+                            ScrollView {
+                                Text((p.text ?? "").isEmpty ? "текста нет" : (p.text ?? ""))
+                                    .font(.caption2)
+                                    .foregroundStyle(.white.opacity(0.85))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .textSelection(.enabled)
+                            }
+                            .frame(maxHeight: 110)
+                        }
+                        .padding(8)
+                        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                    }
 
                     HStack(spacing: 10) {
                         if target.isGroup {
