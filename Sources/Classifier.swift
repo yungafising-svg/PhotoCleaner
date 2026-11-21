@@ -7,6 +7,9 @@ enum Classifier {
         let sorted = infos.sorted { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
         var uf = UnionFind(sorted.count)
         let thr = Float(t.similar)
+        // Скриншоты объединяем только если это точная копия: похожие скриншоты
+        // (переписка, чеки, билеты) могут отличаться важной информацией.
+        let screenshotThr: Float = 0.05
 
         func dist(_ a: PhotoInfo, _ b: PhotoInfo) -> Float? {
             guard let fa = a.featurePrint, let fb = b.featurePrint else { return nil }
@@ -17,6 +20,9 @@ enum Classifier {
         func ignored(_ i: Int, _ j: Int) -> Bool {
             notDuplicate.contains(pairKey(sorted[i].id, sorted[j].id))
         }
+        func limit(_ a: PhotoInfo, _ b: PhotoInfo) -> Float {
+            (a.isScreenshot || b.isScreenshot) ? screenshotThr : thr
+        }
 
         // 1. Серии: соседние по времени кадры (до 30 минут) с похожим содержимым
         for i in 0..<sorted.count {
@@ -24,7 +30,9 @@ enum Classifier {
             while j < sorted.count && j - i <= 40 {
                 if let da = sorted[i].date, let db = sorted[j].date,
                    db.timeIntervalSince(da) > 1800 { break }
-                if !ignored(i, j), let d = dist(sorted[i], sorted[j]), d < thr { uf.union(i, j) }
+                if !ignored(i, j), let d = dist(sorted[i], sorted[j]), d < limit(sorted[i], sorted[j]) {
+                    uf.union(i, j)
+                }
                 j += 1
             }
         }
@@ -39,7 +47,8 @@ enum Classifier {
                 if let list = buckets[c][key] { candidates.formUnion(list) }
             }
             for k in candidates where (sorted[k].dHash ^ p.dHash).nonzeroBitCount <= 3 {
-                if !ignored(k, i), (dist(sorted[k], p) ?? 0) < thr { uf.union(k, i) }
+                let d = dist(sorted[k], p) ?? 1
+                if !ignored(k, i), d < limit(sorted[k], p) { uf.union(k, i) }
             }
             for c in 0..<4 {
                 let key = UInt16(truncatingIfNeeded: p.dHash >> (UInt64(c) * 16))
@@ -53,18 +62,15 @@ enum Classifier {
             .filter { $0.count > 1 }
             .map { idxs in idxs.map { sorted[$0] }.sorted { $0.score > $1.score }.map(\.id) }
 
-        // Неудачные кадры (скриншоты не трогаем)
-        let normal = infos.filter { !$0.isScreenshot }
-        let byDateDesc: (PhotoInfo, PhotoInfo) -> Bool = {
-            ($0.date ?? .distantPast) > ($1.date ?? .distantPast)
+        // Случайные кадры: почти чёрные или белые снимки без деталей и без людей
+        // (снято в кармане, пальцем на объективе). Обычные неудачные, но единственные
+        // фото не предлагаем — это память.
+        r.accidental = infos.filter { p in
+            !p.isScreenshot && p.m.faceQuality == nil && p.m.sharpness < 30
+                && (p.m.brightness < 25 || p.m.brightness > 235)
         }
-        r.blurry = normal.filter { $0.m.sharpness < t.blur }
-            .sorted { $0.m.sharpness < $1.m.sharpness }.map(\.id)
-        r.badExposure = normal.filter { $0.m.brightness < t.dark || $0.m.brightness > t.bright }
-            .sorted(by: byDateDesc).map(\.id)
-        r.badFaces = normal.filter { ($0.m.faceQuality ?? 1) < t.face }
-            .sorted { ($0.m.faceQuality ?? 1) < ($1.m.faceQuality ?? 1) }.map(\.id)
-        r.screenshots = infos.filter(\.isScreenshot).sorted(by: byDateDesc).map(\.id)
+        .sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
+        .map(\.id)
         return r
     }
 }
