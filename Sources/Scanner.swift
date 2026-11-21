@@ -19,6 +19,8 @@ final class Scanner: ObservableObject {
     @Published var photos: [String: PhotoInfo] = [:]
     @Published var groups: [[String]] = []          // первый в группе — лучший
     @Published var accidental: [String] = []        // случайные кадры (чёрные/белые без деталей)
+    @Published var screenshotsCheck: [String] = []  // скриншоты без важной информации — на проверку
+    @Published var screenshotsImportant: [String] = []
     @Published var liveFixes: [String: LiveFix] = [:]
     @Published var decisions = Store.loadDecisions()
 
@@ -31,7 +33,8 @@ final class Scanner: ObservableObject {
     func isProtected(_ id: String) -> Bool {
         if decisions.protected.contains(id) { return true }
         guard let p = photos[id] else { return false }
-        if p.isFavorite || p.isScreenshot { return true }
+        if p.isFavorite { return true }
+        if p.isScreenshot && !p.tags.isEmpty { return true }   // пароли, документы, деньги…
         if Prefs.protectAlbums && p.inAlbum { return true }
         if Prefs.protectEdited && p.isEdited { return true }
         return false
@@ -93,7 +96,9 @@ final class Scanner: ObservableObject {
         var entries: [String: CacheEntry] = [:]
         var toAnalyze: [PHAsset] = []
         for a in assets {
-            if let c = cache[a.localIdentifier], c.modified == a.modificationDate {
+            let isShot = a.mediaSubtypes.contains(.photoScreenshot)
+            if let c = cache[a.localIdentifier], c.modified == a.modificationDate,
+               !isShot || c.text != nil {
                 entries[a.localIdentifier] = c
             } else {
                 toAnalyze.append(a)
@@ -143,6 +148,8 @@ final class Scanner: ObservableObject {
         let fp = e.featurePrint.flatMap {
             try? NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: $0)
         }
+        let isShot = a.mediaSubtypes.contains(.photoScreenshot)
+        let tags = isShot ? ScreenshotSorter.tags(text: e.text ?? "", hasCode: e.hasCode ?? false) : []
         return PhotoInfo(id: a.localIdentifier,
                          asset: a,
                          date: a.creationDate,
@@ -154,7 +161,9 @@ final class Scanner: ObservableObject {
                          bytes: e.bytes,
                          m: e.metrics,
                          dHash: e.dHash,
-                         featurePrint: fp)
+                         featurePrint: fp,
+                         text: e.text,
+                         tags: tags)
     }
 
     /// Все фото, которые лежат в альбомах пользователя
@@ -178,6 +187,17 @@ final class Scanner: ObservableObject {
         }.value
         groups = r.groups.map(orderGroup).sorted { reclaimable($0) > reclaimable($1) }
         accidental = r.accidental
+        let shots = photos.values.filter(\.isScreenshot)
+        screenshotsImportant = shots.filter { !$0.tags.isEmpty }
+            .sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }.map(\.id)
+        // На проверку: сначала совсем без текста, потом самые старые
+        screenshotsCheck = shots.filter { $0.tags.isEmpty }
+            .sorted { a, b in
+                let wa = ScreenshotSorter.wordCount(a.text), wb = ScreenshotSorter.wordCount(b.text)
+                if (wa < 3) != (wb < 3) { return wa < 3 }
+                return (a.date ?? .distantPast) < (b.date ?? .distantPast)
+            }
+            .map(\.id)
     }
 
     /// Порядок в группе: выбранный вручную, затем по оценке
@@ -364,6 +384,7 @@ final class Scanner: ObservableObject {
         for id in ids { photos[id] = nil; cache[id] = nil }
         groups = groups.map { $0.filter { !gone.contains($0) } }.filter { $0.count > 1 }
         accidental.removeAll { gone.contains($0) }
+        screenshotsCheck.removeAll { gone.contains($0) }
         for id in ids { liveFixes[id] = nil }
         decisions.trash = []
         decisions.preferred.subtract(gone)

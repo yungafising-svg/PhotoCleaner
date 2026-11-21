@@ -41,11 +41,43 @@ enum Analyzer {
         if (try? handler.perform([fpReq])) != nil, let fp = fpReq.results?.first {
             fpData = try? NSKeyedArchiver.archivedData(withRootObject: fp, requiringSecureCoding: true)
         }
-        return CacheEntry(modified: asset.modificationDate,
-                          bytes: fileSize(asset),
-                          metrics: m,
-                          dHash: dHash(cg),
-                          featurePrint: fpData)
+        var entry = CacheEntry(modified: asset.modificationDate,
+                               bytes: fileSize(asset),
+                               metrics: m,
+                               dHash: dHash(cg),
+                               featurePrint: fpData)
+        if asset.mediaSubtypes.contains(.photoScreenshot) {
+            let r = await readScreenshot(asset)
+            entry.text = r.text
+            entry.hasCode = r.hasCode
+        }
+        return entry
+    }
+
+    /// Читает текст и ищет QR/штрихкоды на скриншоте (всё на телефоне)
+    static func readScreenshot(_ asset: PHAsset) async -> (text: String, hasCode: Bool) {
+        guard let ui = await ImageLoader.image(for: asset, side: 2000, network: false),
+              let cg = ui.cgImage else { return ("", false) }
+        let handler = VNImageRequestHandler(cgImage: cg,
+                                            orientation: CGImagePropertyOrientation(ui.imageOrientation),
+                                            options: [:])
+        let textReq = VNRecognizeTextRequest()
+        textReq.recognitionLevel = .accurate
+        textReq.usesLanguageCorrection = false
+        let supported = (try? textReq.supportedRecognitionLanguages()) ?? []
+        let wanted = ["ru-RU", "en-US", "vi-VT", "vi-VN"].filter { supported.contains($0) }
+        if !wanted.isEmpty { textReq.recognitionLanguages = wanted }
+        var text = ""
+        if (try? handler.perform([textReq])) != nil {
+            let lines = (textReq.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+            text = String(lines.joined(separator: "\n").prefix(3000))
+        }
+        let codeReq = VNDetectBarcodesRequest()
+        var hasCode = false
+        if (try? handler.perform([codeReq])) != nil {
+            hasCode = !(codeReq.results ?? []).isEmpty
+        }
+        return (text, hasCode)
     }
 
     /// Размер фото на диске (вместе с видео Live Photo)
