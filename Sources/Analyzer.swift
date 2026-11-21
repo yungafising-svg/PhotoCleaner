@@ -139,29 +139,44 @@ struct Gray {
     /// Резкость: всего кадра и самого резкого участка (сетка 4×4).
     /// Портрет с размытым фоном не считается размытым — смотрим на объект.
     func sharpness(tiles n: Int = 4) -> (global: Double, subject: Double) {
-        let w = self.w, h = self.h
-        return px.withUnsafeBufferPointer { p -> (global: Double, subject: Double) in
-            var ts = [Double](repeating: 0, count: n * n)
-            var tq = ts, tc = ts
-            var s = 0.0, q = 0.0, c = 0.0
-            for y in 1..<(h - 1) {
-                let row = y * w
-                let ty = min(n - 1, y * n / h)
-                for x in 1..<(w - 1) {
-                    let i = row + x
-                    let v = Double(4 * Int(p[i]) - Int(p[i - 1]) - Int(p[i + 1]) - Int(p[i - w]) - Int(p[i + w]))
-                    let k = ty * n + min(n - 1, x * n / w)
-                    ts[k] += v; tq[k] += v * v; tc[k] += 1
-                    s += v; q += v * v; c += 1
-                }
+        let w = self.w
+        let h = self.h
+        let p = px
+        var ts = [Double](repeating: 0, count: n * n)
+        var tq = [Double](repeating: 0, count: n * n)
+        var tc = [Double](repeating: 0, count: n * n)
+        var s = 0.0
+        var q = 0.0
+        var c = 0.0
+        for y in 1..<(h - 1) {
+            let row = y * w
+            let ty = min(n - 1, y * n / h)
+            for x in 1..<(w - 1) {
+                let i = row + x
+                let center: Int = 4 * Int(p[i])
+                let horiz: Int = Int(p[i - 1]) + Int(p[i + 1])
+                let vert: Int = Int(p[i - w]) + Int(p[i + w])
+                let v = Double(center - horiz - vert)
+                let k = ty * n + min(n - 1, x * n / w)
+                ts[k] += v
+                tq[k] += v * v
+                tc[k] += 1
+                s += v
+                q += v * v
+                c += 1
             }
-            func variance(_ s: Double, _ q: Double, _ c: Double) -> Double {
-                c > 0 ? q / c - (s / c) * (s / c) : 0
-            }
-            let tiles = (0..<(n * n)).map { variance(ts[$0], tq[$0], tc[$0]) }.sorted(by: >)
-            let subject = tiles.prefix(2).reduce(0, +) / 2
-            return (variance(s, q, c), subject)
         }
+        var tiles: [Double] = []
+        for k in 0..<(n * n) { tiles.append(Gray.variance(ts[k], tq[k], tc[k])) }
+        tiles.sort(by: >)
+        let subject = (tiles[0] + tiles[min(1, tiles.count - 1)]) / 2
+        return (Gray.variance(s, q, c), subject)
+    }
+
+    static func variance(_ s: Double, _ q: Double, _ c: Double) -> Double {
+        guard c > 0 else { return 0 }
+        let mean = s / c
+        return q / c - mean * mean
     }
 
     func exposure() -> (mean: Double, clipped: Double) {
