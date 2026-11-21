@@ -102,10 +102,7 @@ enum Keys {
 
 struct Results: Sendable {
     var groups: [[String]] = []
-    var blurry: [String] = []
-    var badExposure: [String] = []
-    var badFaces: [String] = []
-    var screenshots: [String] = []
+    var accidental: [String] = []
 }
 
 func pairKey(_ a: String, _ b: String) -> String { a < b ? a + "|" + b : b + "|" + a }
