@@ -28,8 +28,17 @@ enum LiveFrames {
         }
     }
 
-    /// Перебирает кадры видео и возвращает лучший, если он заметно лучше текущего титульного
-    static func bestFrame(for info: PhotoInfo, samples: Int = 15) async -> LiveFix? {
+    /// Стоит ли вообще искать замену титульному кадру
+    static func needsFix(_ info: PhotoInfo, blurThreshold: Double) -> Bool {
+        guard info.isLive, !info.isScreenshot else { return false }
+        // Тёмные и пересвеченные кадры не трогаем: в видео они такие же
+        if info.m.brightness < 45 || info.m.brightness > 215 { return false }
+        if let fq = info.m.faceQuality, fq < 0.35 { return true }      // закрытые глаза, смаз лица
+        return info.m.sharpness < blurThreshold                        // смаз
+    }
+
+    /// Перебирает кадры видео и возвращает лучший, только если он ЯВНО лучше текущего
+    static func bestFrame(for info: PhotoInfo, samples: Int = 20) async -> LiveFix? {
         guard let url = await pairedVideoURL(info.asset, network: false) else { return nil }
         defer { try? FileManager.default.removeItem(at: url) }
 
@@ -42,23 +51,52 @@ enum LiveFrames {
         gen.requestedTimeToleranceBefore = .zero
         gen.requestedTimeToleranceAfter = .zero
 
+        let still = info.m
         var bestImage: CGImage?
         var bestTime = 0.0
         var bestScore = -Double.infinity
         for k in 0..<samples {
             let t = duration * (Double(k) + 0.5) / Double(samples)
             guard let cg = try? await gen.image(at: CMTime(seconds: t, preferredTimescale: 600)).image else { continue }
-            let s = Analyzer.score(Analyzer.measure(cg, orientation: .up))
+            let m = Analyzer.measure(cg, orientation: .up)
+            guard isClearlyBetter(m, than: still) else { continue }
+            let s = Analyzer.score(m)
             if s > bestScore {
                 bestScore = s
                 bestTime = t
                 bestImage = cg
             }
         }
-        let current = Analyzer.score(info.m)
-        guard let img = bestImage, bestScore > current + 0.15 else { return nil }
+        guard let img = bestImage else { return nil }
         return LiveFix(id: info.id, time: bestTime, preview: UIImage(cgImage: img),
-                       oldScore: current, newScore: bestScore)
+                       oldScore: Analyzer.score(still), newScore: bestScore)
+    }
+
+    /// Строгие правила: кадр из видео должен быть нормально экспонирован, не мыльнее
+    /// и заметно лучше по лицам или по резкости
+    static func isClearlyBetter(_ m: Metrics, than still: Metrics) -> Bool {
+        if m.brightness < 45 || m.brightness > 215 { return false }
+        if m.clipped > still.clipped + 0.1 { return false }
+        if let sf = still.faceQuality {
+            // На фото есть лица: в кадре они тоже должны быть и заметно лучше
+            guard let mf = m.faceQuality else { return false }
+            return mf >= sf + 0.2 && m.sharpness >= still.sharpness * 0.75
+        }
+        if m.faceQuality != nil { return false }
+        // Без лиц — только если кадр намного резче
+        return m.sharpness >= still.sharpness * 1.8 && m.sharpness >= 80
+    }
+
+    /// Кадр из видео в хорошем размере — для крупного просмотра
+    static func frameImage(_ asset: PHAsset, time: Double) async -> UIImage? {
+        guard let url = await pairedVideoURL(asset, network: true) else { return nil }
+        defer { try? FileManager.default.removeItem(at: url) }
+        let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        gen.appliesPreferredTrackTransform = true
+        gen.requestedTimeToleranceBefore = .zero
+        gen.requestedTimeToleranceAfter = .zero
+        guard let cg = try? await gen.image(at: CMTime(seconds: time, preferredTimescale: 600)).image else { return nil }
+        return UIImage(cgImage: cg)
     }
 
     /// Готовит правку: титульный кадр заменяется кадром из видео, фото остаётся живым
