@@ -97,7 +97,10 @@ final class Scanner: ObservableObject {
         var toAnalyze: [PHAsset] = []
         for a in assets {
             let isShot = a.mediaSubtypes.contains(.photoScreenshot)
-            if let c = cache[a.localIdentifier], c.modified == a.modificationDate,
+            // Дату изменения iCloud обновляет и без правки фото, поэтому сверяем её
+            // только у отредактированных снимков
+            if let c = cache[a.localIdentifier],
+               !a.hasAdjustments || c.modified == a.modificationDate,
                !isShot || c.text != nil {
                 entries[a.localIdentifier] = c
             } else {
@@ -105,8 +108,10 @@ final class Scanner: ObservableObject {
             }
         }
 
-        stage = "Анализирую новые фото"
-        total = toAnalyze.count
+        stage = "Проверяю фото"
+        total = assets.count          // вся медиатека
+        processed = entries.count     // уже проверенные раньше — сразу засчитаны
+        progress = Double(processed) / Double(max(total, 1))
         await withTaskGroup(of: (String, CacheEntry?).self) { group in
             var idx = 0
             let parallel = 4
@@ -118,6 +123,11 @@ final class Scanner: ObservableObject {
                 let (id, entry) = result
                 if let entry { entries[id] = entry; cache[id] = entry } else { skipped += 1 }
                 processed += 1
+                // Сохраняем память по ходу, чтобы закрытие приложения не сбрасывало работу
+                if processed % 500 == 0 {
+                    let snap = cache
+                    Task.detached(priority: .utility) { Store.saveCache(snap) }
+                }
                 progress = Double(processed) / Double(max(total, 1))
                 if Task.isCancelled { group.cancelAll(); break }
                 if idx < toAnalyze.count {
