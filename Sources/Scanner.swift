@@ -12,6 +12,9 @@ final class Scanner: ObservableObject {
     @Published var processed = 0
     @Published var total = 0
     @Published var skipped = 0
+    @Published var stage = "Анализирую фото"
+    @Published var lastError: String?
+    @Published var liveFixes: [String: LiveFix] = [:]
 
     @Published var photos: [String: PhotoInfo] = [:]
     @Published var groups: [[String]] = []
@@ -24,6 +27,9 @@ final class Scanner: ObservableObject {
     private var task: Task<Void, Never>?
 
     var extraInGroups: Int { groups.reduce(0) { $0 + $1.count - 1 } }
+
+    /// Живые фото, которые можно исправить, не предлагаем удалять
+    func visible(_ ids: [String]) -> [String] { ids.filter { liveFixes[$0] == nil } }
 
     func requestAccess() async {
         auth = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
@@ -39,6 +45,8 @@ final class Scanner: ObservableObject {
     private func run(limit: Int?) async {
         phase = .scanning
         progress = 0; processed = 0; skipped = 0
+        stage = "Анализирую фото"
+        liveFixes = [:]
 
         let opts = PHFetchOptions()
         opts.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
@@ -72,7 +80,59 @@ final class Scanner: ObservableObject {
         infos = collected
         photos = Dictionary(uniqueKeysWithValues: collected.map { ($0.id, $0) })
         await reclassify()
+        if !Task.isCancelled { await findLiveFixes() }
         phase = .done
+    }
+
+    /// Для неудачных живых фото ищем кадр лучше внутри видео
+    private func findLiveFixes() async {
+        let bad = Set(blurry + badFaces + badExposure)
+        let candidates = bad.compactMap { photos[$0] }.filter { $0.isLive }
+        guard !candidates.isEmpty else { return }
+        stage = "Ищу лучший кадр в живых фото"
+        processed = 0
+        total = candidates.count
+        progress = 0
+        var fixes: [String: LiveFix] = [:]
+        for c in candidates {
+            if Task.isCancelled { break }
+            if let f = await LiveFrames.bestFrame(for: c) { fixes[f.id] = f }
+            processed += 1
+            progress = Double(processed) / Double(max(total, 1))
+        }
+        liveFixes = fixes
+    }
+
+    /// Делает найденные кадры титульными (iOS один раз спросит разрешение на изменение)
+    func applyFixes(_ ids: [String]) async {
+        var prepared: [(asset: PHAsset, output: PHContentEditingOutput, id: String)] = []
+        for id in ids {
+            guard let fix = liveFixes[id], let p = photos[id] else { continue }
+            do {
+                let out = try await LiveFrames.prepare(fix, asset: p.asset)
+                prepared.append((p.asset, out, id))
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+        guard !prepared.isEmpty else { return }
+        do {
+            try await PHPhotoLibrary.shared().performChanges {
+                for item in prepared {
+                    PHAssetChangeRequest(for: item.asset).contentEditingOutput = item.output
+                }
+            }
+        } catch {
+            lastError = error.localizedDescription
+            return
+        }
+        for item in prepared {
+            let id = item.id
+            liveFixes[id] = nil
+            blurry.removeAll { $0 == id }
+            badFaces.removeAll { $0 == id }
+            badExposure.removeAll { $0 == id }
+        }
     }
 
     func reclassify() async {
