@@ -81,7 +81,7 @@ struct ContentView: View {
                 }
             } footer: {
                 if scanner.phase == .done {
-                    Text("Повторное сканирование проверяет только новые фото. Избранное, фото из альбомов и отредактированные не трогаются.")
+                    Text("Неудачные, но единственные кадры не трогаем — это память. Скриншоты, избранное, фото из альбомов и отредактированные тоже защищены. Повторный скан проверяет только новые фото.")
                 }
             }
 
@@ -95,17 +95,8 @@ struct ContentView: View {
                     NavigationLink { GroupsView() } label: {
                         row("Похожие и дубликаты", "square.on.square", scanner.groups.count)
                     }
-                    NavigationLink { FlaggedGridView(title: "Размытые", list: \.blurry) } label: {
-                        row("Размытые", "camera.metering.unknown", scanner.visible(scanner.blurry).count)
-                    }
-                    NavigationLink { FlaggedGridView(title: "Тёмные / пересвет", list: \.badExposure) } label: {
-                        row("Тёмные и пересвеченные", "sun.max", scanner.visible(scanner.badExposure).count)
-                    }
-                    NavigationLink { FlaggedGridView(title: "Неудачные лица", list: \.badFaces) } label: {
-                        row("Закрытые глаза / смаз лица", "face.dashed", scanner.visible(scanner.badFaces).count)
-                    }
-                    NavigationLink { FlaggedGridView(title: "Скриншоты", list: \.screenshots) } label: {
-                        row("Скриншоты", "iphone", scanner.visible(scanner.screenshots).count)
+                    NavigationLink { FlaggedGridView(title: "Случайные кадры", list: \.accidental) } label: {
+                        row("Случайные кадры", "camera.metering.unknown", scanner.visible(scanner.accidental).count)
                     }
                 }
                 if scanner.skipped > 0 {
@@ -290,8 +281,8 @@ struct CompareView: View {
             TabView(selection: $current) {
                 ForEach(target.ids, id: \.self) { id in
                     Group {
-                        if let p = scanner.photos[id] {
-                            ZoomableAsset(asset: p.asset)
+                        if let a = scanner.asset(id) {
+                            ZoomableAsset(asset: a)
                         } else {
                             Color.black
                         }
@@ -301,7 +292,7 @@ struct CompareView: View {
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
 
-            if let p = scanner.photos[current] {
+            if !current.isEmpty {
                 VStack(spacing: 10) {
                     HStack(spacing: 12) {
                         if target.isGroup && scanner.groups.first(where: { $0.contains(current) })?.first == current {
@@ -310,9 +301,11 @@ struct CompareView: View {
                         if scanner.isProtected(current) {
                             Label("защищено", systemImage: "lock.fill").foregroundStyle(.yellow)
                         }
-                        Text("резкость \(Int(p.m.sharpness))")
-                        if let fq = p.m.faceQuality { Text("лица \(Int(fq * 100))%") }
-                        Text(formatBytes(p.bytes))
+                        if let p = scanner.photos[current] {
+                            Text("резкость \(Int(p.m.sharpness))")
+                            if let fq = p.m.faceQuality { Text("лица \(Int(fq * 100))%") }
+                            Text(formatBytes(p.bytes))
+                        }
                     }
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.8))
@@ -346,9 +339,19 @@ struct CompareView: View {
     }
 }
 
-/// Фото с зумом щипком и двойным тапом
-struct ZoomableAsset: UIViewRepresentable {
+/// Фото из библиотеки с зумом
+struct ZoomableAsset: View {
     let asset: PHAsset
+    var body: some View {
+        let a = asset
+        ZoomableImage(key: a.localIdentifier) { await ImageLoader.image(for: a, side: 2400, network: true) }
+    }
+}
+
+/// Картинка с зумом щипком и двойным тапом
+struct ZoomableImage: UIViewRepresentable {
+    let key: String
+    let load: () async -> UIImage?
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -379,9 +382,9 @@ struct ZoomableAsset: UIViewRepresentable {
         dbl.numberOfTapsRequired = 2
         sv.addGestureRecognizer(dbl)
 
-        let a = asset
+        let loader = load
         Task { @MainActor in
-            iv.image = await ImageLoader.image(for: a, side: 2400, network: true)
+            iv.image = await loader()
         }
         return sv
     }
@@ -473,14 +476,19 @@ struct SwipeView: View {
     @State private var history: [(id: String, keep: Bool)] = []
     @State private var drag: CGSize = .zero
     @State private var started = false
+    @State private var compare: CompareTarget?
 
     var body: some View {
         VStack(spacing: 16) {
             if index < assets.count {
-                Text("\(index + 1) из \(assets.count)").font(.caption).foregroundStyle(.secondary)
+                Text("\(index + 1) из \(assets.count) · тап — крупно").font(.caption).foregroundStyle(.secondary)
                 ZStack {
                     SwipeCard(asset: assets[index])
                         .id(assets[index].localIdentifier)
+                        .onTapGesture {
+                            let id = assets[index].localIdentifier
+                            compare = CompareTarget(ids: [id], start: id, isGroup: false)
+                        }
                         .offset(drag)
                         .rotationEffect(.degrees(Double(drag.width / 20)))
                         .overlay(alignment: .top) {
@@ -519,6 +527,7 @@ struct SwipeView: View {
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
         .safeAreaInset(edge: .bottom) { TrashBar() }
+        .fullScreenCover(item: $compare) { CompareView(target: $0) }
         .onAppear {
             guard !started else { return }
             started = true
@@ -587,6 +596,7 @@ struct TrashView: View {
     @State private var assets: [PHAsset] = []
     @State private var bytes: Int64 = 0
     @State private var busy = false
+    @State private var compare: CompareTarget?
     private let columns = [GridItem(.adaptive(minimum: 90), spacing: 4)]
 
     var body: some View {
@@ -596,21 +606,16 @@ struct TrashView: View {
                                        description: Text("Отмечай фото в разделах или в свайп-режиме — они соберутся здесь для финальной проверки."))
                     .padding(.top, 80)
             } else {
-                Text("\(assets.count) фото · \(formatBytes(bytes)). Тап по фото — вернуть его.")
+                Text("\(assets.count) фото · \(formatBytes(bytes)). Тап — вернуть, ⤢ — крупно.")
                     .font(.footnote).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 8)
                 LazyVGrid(columns: columns, spacing: 4) {
                     ForEach(assets, id: \.localIdentifier) { a in
-                        Thumb(asset: a)
-                            .onTapGesture { scanner.removeFromTrash([a.localIdentifier]) }
-                            .contextMenu {
-                                Button("Вернуть", systemImage: "arrow.uturn.backward") {
-                                    scanner.removeFromTrash([a.localIdentifier])
-                                }
-                            } preview: {
-                                BigPreview(asset: a)
-                            }
+                        SelectableThumb(asset: a, selected: true, onExpand: {
+                            compare = CompareTarget(ids: assets.map(\.localIdentifier), start: a.localIdentifier, isGroup: false)
+                        })
+                        .onTapGesture { scanner.removeFromTrash([a.localIdentifier]) }
                     }
                 }
                 .padding(4)
@@ -649,6 +654,7 @@ struct TrashView: View {
                 .background(.ultraThinMaterial)
             }
         }
+        .fullScreenCover(item: $compare) { CompareView(target: $0) }
         .task(id: scanner.decisions.trash) { reload() }
     }
 
@@ -692,9 +698,14 @@ struct TrashBar: View {
 
 // MARK: - Живые фото: замена титульного кадра
 
+struct LiveCompareTarget: Identifiable {
+    let id: String
+}
+
 struct LiveFixView: View {
     @EnvironmentObject var scanner: Scanner
     @State private var busy: Set<String> = []
+    @State private var compare: LiveCompareTarget?
 
     var body: some View {
         let ids = scanner.liveFixes.keys.sorted {
@@ -717,45 +728,44 @@ struct LiveFixView: View {
                                         .overlay { Image(uiImage: fix.preview).resizable().scaledToFill() }
                                         .clipShape(RoundedRectangle(cornerRadius: 8))
                                         .frame(width: 130)
-                                    Text("лучший кадр").font(.caption).foregroundStyle(.green)
+                                    Text("предлагаю").font(.caption).foregroundStyle(.green)
                                 }
                             }
-                            Button {
-                                Task {
-                                    busy.insert(id)
-                                    await scanner.applyFixes([id])
-                                    busy.remove(id)
+                            .contentShape(Rectangle())
+                            .onTapGesture { compare = LiveCompareTarget(id: id) }
+                            HStack {
+                                Button {
+                                    Task {
+                                        busy.insert(id)
+                                        await scanner.applyFixes([id])
+                                        busy.remove(id)
+                                    }
+                                } label: {
+                                    if busy.contains(id) {
+                                        ProgressView()
+                                    } else {
+                                        Label("Сделать титульным", systemImage: "checkmark")
+                                    }
                                 }
-                            } label: {
-                                if busy.contains(id) {
-                                    ProgressView()
-                                } else {
-                                    Label("Сделать титульным", systemImage: "checkmark")
-                                }
+                                .buttonStyle(.bordered)
+                                .tint(.green)
+                                Button("Сравнить") { compare = LiveCompareTarget(id: id) }
+                                    .buttonStyle(.bordered)
+                                Button("Оставить как есть") { scanner.skipLiveFix(id) }
+                                    .buttonStyle(.bordered)
+                                    .tint(.gray)
                             }
-                            .buttonStyle(.bordered)
                             .disabled(!busy.isEmpty)
                         }
                         .padding(.vertical, 4)
                     }
                 }
             } footer: {
-                Text("Фото остаётся живым, меняется только титульный кадр. Вернуть как было: Фото → Изменить → Вернуть.")
+                Text("Тап по паре — сравнить крупно. Фото остаётся живым, меняется только титульный кадр. Вернуть как было: Фото → Изменить → Вернуть.")
             }
         }
         .navigationTitle("Живые фото")
-        .toolbar {
-            if ids.count > 1 {
-                Button("Исправить все") {
-                    Task {
-                        busy = Set(ids)
-                        await scanner.applyFixes(ids)
-                        busy = []
-                    }
-                }
-                .disabled(!busy.isEmpty)
-            }
-        }
+        .fullScreenCover(item: $compare) { LiveCompareView(id: $0.id) }
         .alert("Не получилось",
                isPresented: Binding(get: { scanner.lastError != nil },
                                     set: { if !$0 { scanner.lastError = nil } })) {
@@ -766,6 +776,67 @@ struct LiveFixView: View {
     }
 }
 
+/// Крупное сравнение: текущий титульный кадр и предлагаемый
+struct LiveCompareView: View {
+    @EnvironmentObject var scanner: Scanner
+    @Environment(\.dismiss) private var dismiss
+    let id: String
+    @State private var showNew = true
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Button("Готово") { dismiss() }.bold()
+                Spacer()
+            }
+            .padding()
+            .foregroundStyle(.white)
+
+            Picker("", selection: $showNew) {
+                Text("Сейчас").tag(false)
+                Text("Предлагаю").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal)
+
+            if let p = scanner.photos[id], let fix = scanner.liveFixes[id] {
+                let asset = p.asset
+                let time = fix.time
+                Group {
+                    if showNew {
+                        ZoomableImage(key: id + "-new") { await LiveFrames.frameImage(asset, time: time) }
+                            .id("new")
+                    } else {
+                        ZoomableAsset(asset: asset)
+                            .id("old")
+                    }
+                }
+                .frame(maxHeight: .infinity)
+
+                HStack(spacing: 12) {
+                    Button {
+                        Task {
+                            await scanner.applyFixes([id])
+                            dismiss()
+                        }
+                    } label: { Label("Сделать титульным", systemImage: "checkmark") }
+                    .tint(.green)
+                    Button {
+                        scanner.skipLiveFix(id)
+                        dismiss()
+                    } label: { Label("Оставить как есть", systemImage: "xmark") }
+                    .tint(.gray)
+                }
+                .buttonStyle(.borderedProminent)
+                .padding()
+            } else {
+                Spacer()
+            }
+        }
+        .background(Color.black.ignoresSafeArea())
+    }
+}
+
 // MARK: - Настройки
 
 struct SettingsView: View {
@@ -773,9 +844,6 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage(Keys.similar) private var similar = Thresholds.defaults.similar
     @AppStorage(Keys.blur) private var blur = Thresholds.defaults.blur
-    @AppStorage(Keys.dark) private var dark = Thresholds.defaults.dark
-    @AppStorage(Keys.bright) private var bright = Thresholds.defaults.bright
-    @AppStorage(Keys.face) private var face = Thresholds.defaults.face
     @AppStorage(Keys.protectAlbums) private var protectAlbums = true
     @AppStorage(Keys.protectEdited) private var protectEdited = true
 
@@ -805,23 +873,13 @@ struct SettingsView: View {
                 Section {
                     Slider(value: $blur, in: 20...800)
                     Text("\(Int(blur))").foregroundStyle(.secondary)
-                } header: { Text("Размытость") } footer: {
-                    Text("Оценивается резкость объекта, а не фона. Больше — строже.")
-                }
-                Section("Экспозиция") {
-                    Stepper("Темнее чем: \(Int(dark))", value: $dark, in: 5...100, step: 5)
-                    Stepper("Светлее чем: \(Int(bright))", value: $bright, in: 150...250, step: 5)
-                }
-                Section {
-                    Slider(value: $face, in: 0.05...0.6)
-                    Text(String(format: "%.2f", face)).foregroundStyle(.secondary)
-                } header: { Text("Качество лица") } footer: {
-                    Text("Больше — строже к закрытым глазам и смазанным лицам.")
+                } header: { Text("Смаз в живых фото") } footer: {
+                    Text("Ниже этого порога приложение поищет в живом фото более резкий кадр. Оценивается объект, а не фон.")
                 }
                 Section {
                     Button("Пороги по умолчанию") {
                         let d = Thresholds.defaults
-                        similar = d.similar; blur = d.blur; dark = d.dark; bright = d.bright; face = d.face
+                        similar = d.similar; blur = d.blur
                     }
                     Button("Проанализировать всё заново", role: .destructive) { scanner.resetCache() }
                 } footer: {
