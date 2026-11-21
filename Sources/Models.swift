@@ -1,6 +1,7 @@
 import Foundation
 import Photos
 import Vision
+import UIKit
 
 /// Результат анализа одного фото
 struct PhotoInfo: Identifiable, @unchecked Sendable {
@@ -8,6 +9,7 @@ struct PhotoInfo: Identifiable, @unchecked Sendable {
     let asset: PHAsset
     let date: Date?
     let isScreenshot: Bool
+    let isLive: Bool
 
     var sharpness: Double = 0        // дисперсия Лапласиана: меньше = размытее
     var brightness: Double = 128     // средняя яркость 0...255
@@ -56,4 +58,21 @@ struct Results: Sendable {
     var badExposure: [String] = []
     var badFaces: [String] = []
     var screenshots: [String] = []
+}
+
+/// Метрики качества одного кадра
+struct Metrics {
+    var sharpness: Double = 0
+    var brightness: Double = 128
+    var clipped: Double = 0
+    var faceQuality: Double? = nil
+}
+
+/// Найденный в Live Photo кадр лучше текущего титульного
+struct LiveFix: Identifiable, @unchecked Sendable {
+    let id: String
+    let time: Double        // секунда внутри видео Live Photo
+    let preview: UIImage
+    let oldScore: Double
+    let newScore: Double
 }
