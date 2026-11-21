@@ -26,42 +26,44 @@ enum ImageLoader {
 }
 
 enum Analyzer {
-    static func analyze(_ asset: PHAsset) async -> PhotoInfo? {
+    /// Полный анализ одного фото (результат кэшируется)
+    static func analyze(_ asset: PHAsset) async -> CacheEntry? {
         guard let ui = await ImageLoader.image(for: asset, side: 512, network: false),
               let cg = ui.cgImage else { return nil }
-
-        var info = PhotoInfo(
-            id: asset.localIdentifier,
-            asset: asset,
-            date: asset.creationDate,
-            isScreenshot: asset.mediaSubtypes.contains(.photoScreenshot),
-            isLive: asset.mediaSubtypes.contains(.photoLive)
-        )
-
         let orientation = CGImagePropertyOrientation(ui.imageOrientation)
         let m = measure(cg, orientation: orientation)
-        info.sharpness = m.sharpness
-        info.brightness = m.brightness
-        info.clipped = m.clipped
-        info.faceQuality = m.faceQuality
-        info.score = score(m)
-        info.dHash = dHash(cg)
 
         // "Отпечаток" изображения для поиска похожих
+        var fpData: Data?
         let handler = VNImageRequestHandler(cgImage: cg, orientation: orientation, options: [:])
         let fpReq = VNGenerateImageFeaturePrintRequest()
         fpReq.revision = VNGenerateImageFeaturePrintRequestRevision2
-        if (try? handler.perform([fpReq])) != nil {
-            info.featurePrint = fpReq.results?.first
+        if (try? handler.perform([fpReq])) != nil, let fp = fpReq.results?.first {
+            fpData = try? NSKeyedArchiver.archivedData(withRootObject: fp, requiringSecureCoding: true)
         }
-        return info
+        return CacheEntry(modified: asset.modificationDate,
+                          bytes: fileSize(asset),
+                          metrics: m,
+                          dHash: dHash(cg),
+                          featurePrint: fpData)
+    }
+
+    /// Размер фото на диске (вместе с видео Live Photo)
+    static func fileSize(_ asset: PHAsset) -> Int64 {
+        var total: Int64 = 0
+        for r in PHAssetResource.assetResources(for: asset) {
+            if let n = r.value(forKey: "fileSize") as? NSNumber { total += n.int64Value }
+        }
+        return total > 0 ? total : Int64(asset.pixelWidth * asset.pixelHeight / 4)
     }
 
     /// Резкость, экспозиция и качество лиц одного кадра
     static func measure(_ cg: CGImage, orientation: CGImagePropertyOrientation) -> Metrics {
         var m = Metrics()
         if let g = Gray(cg, maxSide: 512) {
-            m.sharpness = g.laplacianVariance()
+            let sh = g.sharpness()
+            m.sharpness = sh.subject
+            m.globalSharpness = sh.global
             let e = g.exposure()
             m.brightness = e.mean
             m.clipped = e.clipped
@@ -76,11 +78,12 @@ enum Analyzer {
         return m
     }
 
+    /// Оценка качества кадра: чем больше, тем лучше
     static func score(_ m: Metrics) -> Double {
         var s = min(1, log10(1 + m.sharpness) / 3)
         if m.brightness < 40 || m.brightness > 220 { s -= 0.3 }
         s -= m.clipped * 0.5
-        if let fq = m.faceQuality { s += fq }
+        if let fq = m.faceQuality { s += fq * 1.2 }
         return s
     }
 
@@ -133,24 +136,31 @@ struct Gray {
         h = height
     }
 
-    func laplacianVariance() -> Double {
+    /// Резкость: всего кадра и самого резкого участка (сетка 4×4).
+    /// Портрет с размытым фоном не считается размытым — смотрим на объект.
+    func sharpness(tiles n: Int = 4) -> (global: Double, subject: Double) {
         let w = self.w, h = self.h
-        return px.withUnsafeBufferPointer { p -> Double in
-            var sum = 0.0, sq = 0.0, n = 0.0
+        return px.withUnsafeBufferPointer { p -> (global: Double, subject: Double) in
+            var ts = [Double](repeating: 0, count: n * n)
+            var tq = ts, tc = ts
+            var s = 0.0, q = 0.0, c = 0.0
             for y in 1..<(h - 1) {
                 let row = y * w
+                let ty = min(n - 1, y * n / h)
                 for x in 1..<(w - 1) {
                     let i = row + x
-                    let v = 4 * Int(p[i]) - Int(p[i - 1]) - Int(p[i + 1]) - Int(p[i - w]) - Int(p[i + w])
-                    let d = Double(v)
-                    sum += d
-                    sq += d * d
-                    n += 1
+                    let v = Double(4 * Int(p[i]) - Int(p[i - 1]) - Int(p[i + 1]) - Int(p[i - w]) - Int(p[i + w]))
+                    let k = ty * n + min(n - 1, x * n / w)
+                    ts[k] += v; tq[k] += v * v; tc[k] += 1
+                    s += v; q += v * v; c += 1
                 }
             }
-            guard n > 0 else { return 0 }
-            let m = sum / n
-            return sq / n - m * m
+            func variance(_ s: Double, _ q: Double, _ c: Double) -> Double {
+                c > 0 ? q / c - (s / c) * (s / c) : 0
+            }
+            let tiles = (0..<(n * n)).map { variance(ts[$0], tq[$0], tc[$0]) }.sorted(by: >)
+            let subject = tiles.prefix(2).reduce(0, +) / 2
+            return (variance(s, q, c), subject)
         }
     }
 
