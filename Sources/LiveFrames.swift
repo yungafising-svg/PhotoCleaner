@@ -55,9 +55,10 @@ enum LiveFrames {
                 bestImage = cg
             }
         }
-        guard let img = bestImage, bestScore > info.score + 0.15 else { return nil }
+        let current = Analyzer.score(info.m)
+        guard let img = bestImage, bestScore > current + 0.15 else { return nil }
         return LiveFix(id: info.id, time: bestTime, preview: UIImage(cgImage: img),
-                       oldScore: info.score, newScore: bestScore)
+                       oldScore: current, newScore: bestScore)
     }
 
     /// Готовит правку: титульный кадр заменяется кадром из видео, фото остаётся живым
