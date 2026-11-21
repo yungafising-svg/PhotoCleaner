@@ -34,45 +34,53 @@ enum Analyzer {
             id: asset.localIdentifier,
             asset: asset,
             date: asset.creationDate,
-            isScreenshot: asset.mediaSubtypes.contains(.photoScreenshot)
+            isScreenshot: asset.mediaSubtypes.contains(.photoScreenshot),
+            isLive: asset.mediaSubtypes.contains(.photoLive)
         )
 
-        // Резкость и экспозиция
-        if let g = Gray(cg, maxSide: 512) {
-            info.sharpness = g.laplacianVariance()
-            let e = g.exposure()
-            info.brightness = e.mean
-            info.clipped = e.clipped
-        }
+        let orientation = CGImagePropertyOrientation(ui.imageOrientation)
+        let m = measure(cg, orientation: orientation)
+        info.sharpness = m.sharpness
+        info.brightness = m.brightness
+        info.clipped = m.clipped
+        info.faceQuality = m.faceQuality
+        info.score = score(m)
         info.dHash = dHash(cg)
 
-        let handler = VNImageRequestHandler(cgImage: cg,
-                                            orientation: CGImagePropertyOrientation(ui.imageOrientation),
-                                            options: [:])
-
         // "Отпечаток" изображения для поиска похожих
+        let handler = VNImageRequestHandler(cgImage: cg, orientation: orientation, options: [:])
         let fpReq = VNGenerateImageFeaturePrintRequest()
         fpReq.revision = VNGenerateImageFeaturePrintRequestRevision2
         if (try? handler.perform([fpReq])) != nil {
             info.featurePrint = fpReq.results?.first
         }
-
-        // Качество лиц (закрытые глаза, смаз, неудачный ракурс)
-        let faceReq = VNDetectFaceCaptureQualityRequest()
-        if (try? handler.perform([faceReq])) != nil,
-           let faces = faceReq.results, !faces.isEmpty {
-            info.faceQuality = faces.compactMap { $0.faceCaptureQuality }.max().map { Double($0) }
-        }
-
-        info.score = score(info)
         return info
     }
 
-    static func score(_ i: PhotoInfo) -> Double {
-        var s = min(1, log10(1 + i.sharpness) / 3)
-        if i.brightness < 40 || i.brightness > 220 { s -= 0.3 }
-        s -= i.clipped * 0.5
-        if let fq = i.faceQuality { s += fq }
+    /// Резкость, экспозиция и качество лиц одного кадра
+    static func measure(_ cg: CGImage, orientation: CGImagePropertyOrientation) -> Metrics {
+        var m = Metrics()
+        if let g = Gray(cg, maxSide: 512) {
+            m.sharpness = g.laplacianVariance()
+            let e = g.exposure()
+            m.brightness = e.mean
+            m.clipped = e.clipped
+        }
+        // Качество лиц (закрытые глаза, смаз, неудачный ракурс)
+        let handler = VNImageRequestHandler(cgImage: cg, orientation: orientation, options: [:])
+        let faceReq = VNDetectFaceCaptureQualityRequest()
+        if (try? handler.perform([faceReq])) != nil,
+           let faces = faceReq.results, !faces.isEmpty {
+            m.faceQuality = faces.compactMap { $0.faceCaptureQuality }.max().map { Double($0) }
+        }
+        return m
+    }
+
+    static func score(_ m: Metrics) -> Double {
+        var s = min(1, log10(1 + m.sharpness) / 3)
+        if m.brightness < 40 || m.brightness > 220 { s -= 0.3 }
+        s -= m.clipped * 0.5
+        if let fq = m.faceQuality { s += fq }
         return s
     }
 
