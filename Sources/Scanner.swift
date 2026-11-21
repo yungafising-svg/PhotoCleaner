@@ -18,10 +18,7 @@ final class Scanner: ObservableObject {
 
     @Published var photos: [String: PhotoInfo] = [:]
     @Published var groups: [[String]] = []          // первый в группе — лучший
-    @Published var blurry: [String] = []
-    @Published var badExposure: [String] = []
-    @Published var badFaces: [String] = []
-    @Published var screenshots: [String] = []
+    @Published var accidental: [String] = []        // случайные кадры (чёрные/белые без деталей)
     @Published var liveFixes: [String: LiveFix] = [:]
     @Published var decisions = Store.loadDecisions()
 
@@ -34,15 +31,21 @@ final class Scanner: ObservableObject {
     func isProtected(_ id: String) -> Bool {
         if decisions.protected.contains(id) { return true }
         guard let p = photos[id] else { return false }
-        if p.isFavorite { return true }
+        if p.isFavorite || p.isScreenshot { return true }
         if Prefs.protectAlbums && p.inAlbum { return true }
         if Prefs.protectEdited && p.isEdited { return true }
         return false
     }
 
-    /// Что показывать в списках неудачных: без защищённых и без живых фото, которые можно исправить
+    /// Что показывать в списке случайных кадров: без защищённых
     func visible(_ ids: [String]) -> [String] {
-        ids.filter { liveFixes[$0] == nil && !isProtected($0) }
+        ids.filter { !isProtected($0) }
+    }
+
+    /// Ассет по id: из результатов анализа или напрямую из библиотеки
+    func asset(_ id: String) -> PHAsset? {
+        if let p = photos[id] { return p.asset }
+        return PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject
     }
 
     func inTrash(_ id: String) -> Bool { decisions.trash.contains(id) }
@@ -174,10 +177,7 @@ final class Scanner: ObservableObject {
             Classifier.classify(snapshot, t, notDuplicate: notDup)
         }.value
         groups = r.groups.map(orderGroup).sorted { reclaimable($0) > reclaimable($1) }
-        blurry = r.blurry
-        badExposure = r.badExposure
-        badFaces = r.badFaces
-        screenshots = r.screenshots
+        accidental = r.accidental
     }
 
     /// Порядок в группе: выбранный вручную, затем по оценке
@@ -207,8 +207,11 @@ final class Scanner: ObservableObject {
     // MARK: - Живые фото
 
     private func findLiveFixes() async {
-        let bad = Set(blurry + badFaces + badExposure)
-        let candidates = bad.compactMap { photos[$0] }.filter { $0.isLive }
+        let blur = Thresholds.current.blur
+        let skipped = Set(UserDefaults.standard.stringArray(forKey: "liveSkip") ?? [])
+        let candidates = photos.values.filter {
+            !$0.isEdited && !skipped.contains($0.id) && LiveFrames.needsFix($0, blurThreshold: blur)
+        }
         guard !candidates.isEmpty else { return }
         stage = "Ищу лучший кадр в живых фото"
         processed = 0
@@ -250,9 +253,6 @@ final class Scanner: ObservableObject {
         for item in prepared {
             let id = item.id
             liveFixes[id] = nil
-            blurry.removeAll { $0 == id }
-            badFaces.removeAll { $0 == id }
-            badExposure.removeAll { $0 == id }
         }
     }
 
@@ -323,6 +323,14 @@ final class Scanner: ObservableObject {
         groups.removeAll { $0 == group }
     }
 
+    /// Не предлагать замену кадра для этого живого фото
+    func skipLiveFix(_ id: String) {
+        liveFixes[id] = nil
+        var list = UserDefaults.standard.stringArray(forKey: "liveSkip") ?? []
+        list.append(id)
+        UserDefaults.standard.set(list, forKey: "liveSkip")
+    }
+
     func markSwipeReviewed(_ id: String, _ reviewed: Bool) {
         if reviewed { decisions.swipeReviewed.insert(id) } else { decisions.swipeReviewed.remove(id) }
         save()
@@ -355,10 +363,7 @@ final class Scanner: ObservableObject {
         let gone = Set(ids)
         for id in ids { photos[id] = nil; cache[id] = nil }
         groups = groups.map { $0.filter { !gone.contains($0) } }.filter { $0.count > 1 }
-        blurry.removeAll { gone.contains($0) }
-        badExposure.removeAll { gone.contains($0) }
-        badFaces.removeAll { gone.contains($0) }
-        screenshots.removeAll { gone.contains($0) }
+        accidental.removeAll { gone.contains($0) }
         for id in ids { liveFixes[id] = nil }
         decisions.trash = []
         decisions.preferred.subtract(gone)
